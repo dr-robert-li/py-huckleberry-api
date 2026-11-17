@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- towncrier release notes start -->
 
+## [0.6.1] - 2026-11-17
+
+### Bugfixes
+
+- Log the reason a tool call failed. The server log used to show only the tool name.
+- Run the MCP server in stateless HTTP mode. Sessions used to expire after 30 minutes idle, which made the next call from Claude pay for a rejected request and a new handshake; a service restart had the same effect.
+
+
 ## [0.6.0] - 2026-11-17
 
 ### Features
