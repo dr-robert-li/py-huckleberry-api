@@ -1,8 +1,10 @@
 """Tests for the MCP server: unit tests with a recording fake API, plus live round trips."""
 
 import os
+from pathlib import Path
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 from typing import cast
 from typing import get_type_hints
@@ -31,6 +33,7 @@ class FakeAPI:
 
     def __init__(self, children: dict[str, str]) -> None:
         self.children = children
+        self.running = True
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
 
     def __getattr__(self, name: str):
@@ -52,8 +55,11 @@ class FakeAPI:
             )
         ]
 
-    async def get_tracker(self, cid: str, tracker: str) -> None:
-        return None
+    async def get_tracker(self, cid: str, tracker: str) -> Any:
+        if not self.running:
+            return None
+        active = SimpleNamespace(active=True)
+        return SimpleNamespace(timer=SimpleNamespace(bath=active) if tracker == "activities" else active)
 
     async def list_entries(self, cid: str, tracker: str, start: datetime, end: datetime) -> list[HistoryEntry]:
         self.calls.append(("list_entries", (cid, tracker, start, end), {}))
@@ -129,6 +135,22 @@ async def test_timer_actions_map_and_reject_unused_params() -> None:
         await call(api, "pump_timer", action="pause", end_time="2026-11-17T10:00")
 
 
+async def test_timer_actions_fail_when_nothing_is_running() -> None:
+    api = FakeAPI({"c1": "Ada"})
+    api.running = False
+    for tool, args in (
+        ("sleep_timer", {"action": "complete"}),
+        ("nursing_timer", {"action": "pause"}),
+        ("pump_timer", {"action": "cancel"}),
+        ("activity_timer", {"action": "switch", "mode": "bath"}),
+    ):
+        with pytest.raises(ToolError, match="timer is running"):
+            await call(api, tool, **args)
+    assert not [c for c in api.calls if c[0] != "list_entries"]
+    await call(api, "pump_timer", action="start")
+    assert last_call(api)[0] == "start_pump"
+
+
 async def test_bad_enum_and_bad_time_rejected() -> None:
     api = FakeAPI({"c1": "Ada"})
     with pytest.raises(ToolError):
@@ -193,6 +215,7 @@ def test_email_allowlist_fails_closed() -> None:
     check = mcp_server.email_allowlist_check(frozenset({"mom@example.com"}))
     assert check(_ctx({"email": "Mom@Example.com"}))
     assert not check(_ctx({"email": "stranger@example.com"}))
+    assert not check(_ctx({"email": "mom@example.com", "email_verified": False}))
     assert not check(_ctx({}))
     assert not check(_ctx(None))
 
@@ -200,6 +223,26 @@ def test_email_allowlist_fails_closed() -> None:
 async def test_allowlist_middleware_hides_tools_without_token() -> None:
     async with Client(server(FakeAPI({"c1": "Ada"}), frozenset({"mom@example.com"}))) as client:
         assert await client.list_tools() == []
+
+
+def test_load_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / ".config").mkdir()
+    (tmp_path / ".config" / ".env").write_text(
+        "# comment\nHB_TEST_A=from-file\nexport HB_TEST_B='quoted value'\nHB_TEST_EMPTY=\nHB_TEST_SET=from-file\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    for key in ("HB_TEST_A", "HB_TEST_B", "HB_TEST_EMPTY"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HB_TEST_SET", "from-env")
+    mcp_server.load_env_file()
+    try:
+        assert os.environ["HB_TEST_A"] == "from-file"
+        assert os.environ["HB_TEST_B"] == "quoted value"
+        assert "HB_TEST_EMPTY" not in os.environ
+        assert os.environ["HB_TEST_SET"] == "from-env"
+    finally:
+        os.environ.pop("HB_TEST_A", None)
+        os.environ.pop("HB_TEST_B", None)
 
 
 def test_auth_config(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -219,7 +262,9 @@ def test_auth_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CLERK_OAUTH_CLIENT_SECRET", "secret")
     with pytest.raises(SystemExit):  # base URL still missing
         mcp_server._auth_from_env()
-    monkeypatch.setenv("HUCKLEBERRY_MCP_BASE_URL", "https://hb.tail1234.ts.net")
+    monkeypatch.setenv("HUCKLEBERRY_MCP_BASE_URL", "https://hb.tail1234.ts.net/mcp/")
+    with pytest.raises(SystemExit, match="ALLOWED_EMAILS"):  # Clerk without an allowlist
+        mcp_server._auth_from_env()
     monkeypatch.setenv("HUCKLEBERRY_MCP_ALLOWED_EMAILS", " Mom@Example.com, dad@example.com ")
     auth, allowed = mcp_server._auth_from_env()
     assert auth is not None and allowed == {"mom@example.com", "dad@example.com"}

@@ -55,6 +55,7 @@ from .firebase_types import FirebaseSolidsFeedIntervalData
 from .firebase_types import FirebaseTemperatureData
 from .firebase_types import HealthDataEntry
 from .firebase_types import JsonValue
+from .firebase_types import _MS_EPOCH_THRESHOLD
 from .firebase_types import MedicationUnits
 from .firebase_types import to_firebase_dict
 from .models import HistoryEntry
@@ -144,7 +145,7 @@ def _summary_payloads(
     entry_id: str,
     row: HistoryRow,
     medication_units: MedicationUnits | None = None,
-) -> dict[str, dict[str, object]]:
+) -> dict[str, object]:
     """Build the prefs summary payloads for a row, keyed by prefs field.
 
     Each branch mirrors the writer named in its comment, key for key.
@@ -175,8 +176,8 @@ def _summary_payloads(
         last_side = FirebaseLastSideData(start=row.start, lastSide=row.lastSide)
         return {"lastNursing": to_firebase_dict(last_nursing), "lastSide": to_firebase_dict(last_side)}
     if isinstance(row, FirebaseBottleFeedIntervalData):
-        # FeedingMixin.log_bottle. It also sets prefs.bottleType/bottleAmount/bottleUnits,
-        # the bottle form defaults rather than a "last" summary, so those stay untouched.
+        # FeedingMixin.log_bottle, which also sets the app's next-bottle defaults
+        # prefs.bottleType/bottleAmount/bottleUnits from the same values.
         last_bottle = FirebaseLastBottleData(
             mode="bottle",
             start=row.start,
@@ -185,7 +186,16 @@ def _summary_payloads(
             bottleUnits=row.units,
             offset=row.offset,
         )
-        return {"lastBottle": to_firebase_dict(last_bottle)}
+        payloads: dict[str, object] = {
+            "lastBottle": to_firebase_dict(last_bottle),
+            "bottleType": row.bottleType,
+            "bottleUnits": row.units,
+        }
+        # log_bottle always has an amount; a stored row saved without one leaves the
+        # previous default amount in place rather than writing a null.
+        if row.amount is not None:
+            payloads["bottleAmount"] = row.amount
+        return payloads
     if isinstance(row, FirebaseSolidsFeedIntervalData):
         # SolidsMixin.log_solids omits empty notes and reactions.
         last_solid = FirebaseLastSolidData(
@@ -327,7 +337,10 @@ def _merge_changes(
     allowed = {field.alias or name for name, field in model.model_fields.items()}
     unknown = sorted(set(changes) - allowed)
     if unknown:
-        raise ValueError(f"Unknown {tracker} fields for {model.__name__}: {', '.join(unknown)}")
+        raise ValueError(
+            f"Unknown {tracker} fields for {model.__name__}: {', '.join(unknown)}; "
+            f"valid fields: {', '.join(sorted(allowed))}"
+        )
 
     merged = dict(raw)
     for key, value in changes.items():
@@ -340,6 +353,19 @@ def _merge_changes(
     updated = _validate_row(tracker, merged)
     if type(updated) is not model:
         raise ValueError(f"Changes would turn a {model.__name__} row into {type(updated).__name__}")
+
+    # Nested models ignore unknown keys too, so a change must survive validation
+    # unchanged; otherwise it carried keys or values the schema does not define.
+    dumped = updated.model_dump(by_alias=True, exclude_none=True)
+    for key, value in changes.items():
+        if value is not None and dumped.get(key) != value:
+            raise ValueError(f"Invalid value for {key}: {value!r} is not a valid {model.__name__} value")
+    for key in ("duration", "leftDuration", "rightDuration"):
+        value = dumped.get(key)
+        if key in changes and value is not None and not value >= 0:
+            raise ValueError(f"{key} must be a non-negative number of seconds")
+    if "start" in changes and not 0 <= dumped["start"] < _MS_EPOCH_THRESHOLD:
+        raise ValueError("start must be epoch seconds")
     return merged, updated
 
 
@@ -423,14 +449,18 @@ class EntriesMixin(HuckleberryBase):
             raise ValueError(f"No {tracker} entry {entry_id!r}")
         doc_ref, key, raw, current = loaded
         merged, updated = _merge_changes(tracker, raw, current, changes, time.time())
+        # Everything is read and validated before the first write, so a failure
+        # leaves Firestore untouched.
+        summary_updates = await self._summary_refresh(
+            child_uid, tracker, {_summary_kind(current), _summary_kind(updated)}, entry_id, updated
+        )
 
         if key is None:
             await doc_ref.set(merged)
         else:
             await doc_ref.update({FieldPath("data", key).to_api_repr(): merged})
+        await (await self._tracker_ref(child_uid, tracker)).update(summary_updates)
         _LOGGER.info("Updated %s entry %s for child %s", tracker, entry_id, child_uid)
-
-        await self._refresh_summaries(child_uid, tracker, {_summary_kind(current), _summary_kind(updated)})
         return HistoryEntry(id=entry_id, tracker=tracker, data=updated)
 
     async def delete_entry(self, child_uid: str, tracker: Tracker, entry_id: str) -> None:
@@ -443,19 +473,25 @@ class EntriesMixin(HuckleberryBase):
         if loaded is None:
             raise ValueError(f"No {tracker} entry {entry_id!r}")
         doc_ref, key, _raw, current = loaded
+        # Read and validate before the first write, as in update_entry.
+        summary_updates = await self._summary_refresh(child_uid, tracker, {_summary_kind(current)}, entry_id, None)
 
         if key is None:
             await doc_ref.delete()
         else:
             await doc_ref.update({FieldPath("data", key).to_api_repr(): DELETE_FIELD})
+        await (await self._tracker_ref(child_uid, tracker)).update(summary_updates)
         _LOGGER.info("Deleted %s entry %s for child %s", tracker, entry_id, child_uid)
 
-        await self._refresh_summaries(child_uid, tracker, {_summary_kind(current)})
+    async def _tracker_ref(self, child_uid: str, tracker: Tracker) -> AsyncDocumentReference:
+        """Return the `{tracker}/{child_uid}` root document reference."""
+        client = await self._get_firestore_client()
+        return client.collection(tracker).document(child_uid)
 
     async def _rows_ref(self, child_uid: str, tracker: Tracker) -> AsyncCollectionReference:
         """Return the history subcollection: `data` for health, `intervals` otherwise."""
-        client = await self._get_firestore_client()
-        return client.collection(tracker).document(child_uid).collection("data" if tracker == "health" else "intervals")
+        tracker_ref = await self._tracker_ref(child_uid, tracker)
+        return tracker_ref.collection("data" if tracker == "health" else "intervals")
 
     async def _load_entry(
         self, child_uid: str, tracker: Tracker, entry_id: str
@@ -476,16 +512,27 @@ class EntriesMixin(HuckleberryBase):
             return None
         return doc_ref, key, cast(dict[str, object], raw), _validate_row(tracker, raw)
 
-    async def _refresh_summaries(self, child_uid: str, tracker: Tracker, kinds: set[str]) -> None:
-        """Rewrite each kind's prefs summary from its latest remaining row."""
+    async def _summary_refresh(
+        self,
+        child_uid: str,
+        tracker: Tracker,
+        kinds: set[str],
+        entry_id: str,
+        replacement: HistoryRow | None,
+    ) -> dict[str, object]:
+        """Build the root update that rebuilds each kind's prefs summary.
+
+        Computed before the entry is written: the stored `entry_id` row is skipped
+        and `replacement` (the edited row, or None for a delete) stands in for it.
+        """
         rows_ref = await self._rows_ref(child_uid, tracker)
-        candidates: list[tuple[str, HistoryRow]] = []
+        candidates: list[tuple[str, HistoryRow]] = [] if replacement is None else [(entry_id, replacement)]
 
         # Batched rows carry no indexed start, so every container is read.
         async for doc in rows_ref.where(filter=firestore.FieldFilter("multi", "==", True)).stream():
             for key, raw in _container_rows(doc.to_dict() or {}).items():
                 row = _validate_row(tracker, raw)
-                if _summary_kind(row) in kinds:
+                if _summary_kind(row) in kinds and f"{doc.id}/{key}" != entry_id:
                     candidates.append((f"{doc.id}/{key}", row))
 
         # Standalone rows newest first on the single-field `start` index (no
@@ -497,7 +544,7 @@ class EntriesMixin(HuckleberryBase):
         async with aclosing(newest_first) as docs:
             async for doc in docs:
                 data = doc.to_dict()
-                if not data or data.get("multi"):
+                if not data or data.get("multi") or doc.id == entry_id:
                     continue
                 row = _validate_row(tracker, data)
                 kind = _summary_kind(row)
@@ -513,6 +560,4 @@ class EntriesMixin(HuckleberryBase):
             if isinstance(health, FirebaseHealthDocumentData) and health.prefs and health.prefs.lastMedication:
                 medication_units = health.prefs.lastMedication.units
 
-        updates = _summary_updates(kinds, _latest_by_kind(candidates), medication_units, time.time())
-        await (await self._get_firestore_client()).collection(tracker).document(child_uid).update(updates)
-        _LOGGER.info("Refreshed %s summaries for child %s: %s", tracker, child_uid, ", ".join(sorted(kinds)))
+        return _summary_updates(kinds, _latest_by_kind(candidates), medication_units, time.time())

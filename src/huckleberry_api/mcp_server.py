@@ -1,13 +1,14 @@
 """Remote MCP server exposing :class:`HuckleberryAPI` to Claude as a custom connector.
 
 Run ``huckleberry-mcp`` for Streamable HTTP at ``/mcp`` (behind Clerk OAuth) or
-``huckleberry-mcp --stdio`` for local clients. Configuration is read from the environment:
+``huckleberry-mcp --stdio`` for local clients. Configuration is read from the environment, then from
+``.config/.env`` in the working directory for anything not already set:
 
     HUCKLEBERRY_EMAIL, HUCKLEBERRY_PASSWORD, HUCKLEBERRY_TIMEZONE   required
     HUCKLEBERRY_MCP_HOST (127.0.0.1), HUCKLEBERRY_MCP_PORT (8765)   listen address
     HUCKLEBERRY_MCP_BASE_URL                                        public https origin
     CLERK_DOMAIN, CLERK_OAUTH_CLIENT_ID, CLERK_OAUTH_CLIENT_SECRET  OAuth
-    HUCKLEBERRY_MCP_ALLOWED_EMAILS                                  optional comma-separated allowlist
+    HUCKLEBERRY_MCP_ALLOWED_EMAILS                                  comma-separated emails allowed in
     HUCKLEBERRY_MCP_NO_AUTH=1                                       explicitly serve HTTP without auth
 """
 
@@ -22,6 +23,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from datetime import timedelta
+from pathlib import Path
 from typing import Annotated
 from typing import Any
 from typing import Literal
@@ -128,8 +130,10 @@ def email_allowlist_check(allowed: frozenset[str]) -> Callable[[AuthContext], bo
     """Build an auth check allowing only tokens whose verified email is in ``allowed`` (lowercase)."""
 
     def check(ctx: AuthContext) -> bool:
-        email = ctx.token.claims.get("email") if ctx.token is not None else None
-        return isinstance(email, str) and email.strip().lower() in allowed
+        claims = ctx.token.claims if ctx.token is not None else {}
+        email = claims.get("email")
+        verified = claims.get("email_verified") is not False
+        return verified and isinstance(email, str) and email.strip().lower() in allowed
 
     return check
 
@@ -147,7 +151,7 @@ def create_server(
         api: Authenticated client. When omitted, one is built from the environment at startup.
         timezone: IANA timezone for naive input times and output. Defaults to ``HUCKLEBERRY_TIMEZONE``.
         auth: FastMCP auth provider for HTTP transport.
-        allowed_emails: Lowercase emails allowed to use the tools; empty means any authenticated user.
+        allowed_emails: Lowercase emails allowed to use the tools; empty disables the check (no-auth, stdio).
     """
     tz_name = timezone or os.environ["HUCKLEBERRY_TIMEZONE"]
     clock = _Clock(tz_name)
@@ -201,6 +205,19 @@ def create_server(
         if child is None:
             raise ToolError(f"Several children: say which one ({names})")
         raise ToolError(f"No single child matches {child!r}; children are: {names}")
+
+    async def require_running(cid: str, tracker: Tracker, action: str, mode: str | None = None) -> None:
+        """Refuse timer actions the library silently ignores because no timer is running."""
+        if action == "start":
+            return
+        timers = getattr(await hb().get_tracker(cid, tracker), "timer", None)
+        if tracker == "activities":
+            modes: tuple[str, ...] = get_args(ActivityMode) if action == "switch" else (mode or "",)
+            running = any(getattr(getattr(timers, m, None), "active", False) for m in modes)
+        else:
+            running = getattr(timers, "active", False)
+        if not running:
+            raise ToolError(f"No {mode or tracker} timer is running, so there is nothing to {action}")
 
     def entry_out(entry: HistoryEntry) -> dict[str, Any]:
         data = entry.data
@@ -288,6 +305,7 @@ def create_server(
         api_ = hb()
         _only(action, {"start_time"} if action in ("start", "complete") else set(), start_time=start_time)
         _only(action, {"end_time", "details"} if action == "complete" else set(), end_time=end_time, details=details)
+        await require_running(cid, "sleep", action)
         if action == "start":
             await api_.start_sleep(cid, start_time=clock.maybe(start_time))
         elif action == "pause":
@@ -347,6 +365,7 @@ def create_server(
         _only(action, {"side"} if action in ("start", "resume") else set(), side=side)
         _only(action, {"start_time"} if action in ("start", "complete") else set(), start_time=start_time)
         _only(action, {"end_time"} if action == "complete" else set(), end_time=end_time)
+        await require_running(cid, "feed", action)
         if action == "start":
             await api_.start_nursing(cid, side or "left", start_time=clock.maybe(start_time))
         elif action == "pause":
@@ -450,6 +469,7 @@ def create_server(
             units=units,
             notes=notes,
         )
+        await require_running(cid, "pump", action)
         if action == "start":
             await api_.start_pump(cid, start_time=clock.maybe(start_time))
         elif action == "pause":
@@ -538,6 +558,7 @@ def create_server(
             duration=duration,
             notes=notes,
         )
+        await require_running(cid, "activities", action, mode)
         if action == "start":
             await api_.start_activity(cid, mode, start_time=clock.maybe(start_time))
         elif action == "pause":
@@ -581,12 +602,13 @@ def create_server(
             str | None,
             Field(description="Part of the food name, e.g. 'avoc'. Omit to list only the family's custom foods."),
         ] = None,
+        include_archived: Annotated[bool, Field(description="Also list archived custom foods.")] = False,
         child: Child = None,
     ) -> list[dict[str, Any]]:
         """Find solid foods (Huckleberry's catalog plus the family's custom foods) to use in log_solids.
         Returns id, source and name for each match (at most 50)."""
         cid = await resolve(child)
-        foods: list[Any] = [f for f in await hb().list_solids_custom_foods(cid)]
+        foods: list[Any] = [f for f in await hb().list_solids_custom_foods(cid, include_archived=include_archived)]
         if query:
             needle = query.strip().lower()
             foods = [
@@ -599,11 +621,12 @@ def create_server(
     @mcp.tool
     async def create_custom_food(
         name: Annotated[str, Field(description="Food name as the family calls it.")],
+        image: Annotated[str, Field(description="Firebase Storage image filename. Normally left empty.")] = "",
         child: Child = None,
     ) -> dict[str, Any]:
         """Add a custom solid food when list_foods finds nothing suitable. Returns the new food's id."""
         cid = await resolve(child)
-        return _dump(await hb().create_solids_custom_food(cid, name))
+        return _dump(await hb().create_solids_custom_food(cid, name, image=image))
 
     @mcp.tool
     async def log_solids(
@@ -812,7 +835,8 @@ def _auth_from_env() -> tuple[AuthProvider | None, frozenset[str]]:
 
     Returns the auth provider (None only with ``HUCKLEBERRY_MCP_NO_AUTH=1``) and the email allowlist.
     """
-    base_url = os.environ.get("HUCKLEBERRY_MCP_BASE_URL")
+    # The connector URL is the origin plus /mcp; tolerate a base URL pasted with that path.
+    base_url = os.environ.get("HUCKLEBERRY_MCP_BASE_URL", "").rstrip("/").removesuffix("/mcp")
     allowed = frozenset(
         e.strip().lower() for e in os.environ.get("HUCKLEBERRY_MCP_ALLOWED_EMAILS", "").split(",") if e.strip()
     )
@@ -820,6 +844,10 @@ def _auth_from_env() -> tuple[AuthProvider | None, frozenset[str]]:
     if all(clerk) and base_url:
         domain, client_id, client_secret = clerk
         assert domain and client_id and client_secret
+        if not allowed:
+            raise SystemExit(
+                "Refusing to start: set HUCKLEBERRY_MCP_ALLOWED_EMAILS to the emails allowed to use the server."
+            )
         provider = ClerkProvider(domain=domain, client_id=client_id, client_secret=client_secret, base_url=base_url)
         return provider, allowed
     if os.environ.get("HUCKLEBERRY_MCP_NO_AUTH") == "1":
@@ -831,12 +859,25 @@ def _auth_from_env() -> tuple[AuthProvider | None, frozenset[str]]:
     )
 
 
+def load_env_file(path: str = ".config/.env") -> None:
+    """Load ``KEY=VALUE`` lines from the local config file. Variables already set win; blank values are skipped."""
+    file = Path(path)
+    if not file.is_file():
+        return
+    for line in file.read_text().splitlines():
+        key, sep, value = line.strip().removeprefix("export ").partition("=")
+        value = value.strip().strip("'\"")
+        if sep and value and not key.startswith("#"):
+            os.environ.setdefault(key.strip(), value)
+
+
 def main() -> None:
     """Console entry point: ``huckleberry-mcp [--stdio]``."""
     parser = argparse.ArgumentParser(description="Huckleberry MCP server")
     parser.add_argument("--stdio", action="store_true", help="serve over stdio for local MCP clients")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
+    load_env_file()
     missing = [
         k for k in ("HUCKLEBERRY_EMAIL", "HUCKLEBERRY_PASSWORD", "HUCKLEBERRY_TIMEZONE") if not os.environ.get(k)
     ]

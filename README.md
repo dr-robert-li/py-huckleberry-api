@@ -40,7 +40,8 @@ uv sync --extra mcp
 
 ### 2. Configure
 
-Copy `.env.example` to `~/.config/huckleberry-mcp/env`, run `chmod 600` on it, and fill it in.
+Copy `.env.example` to `.config/.env` in the clone, run `chmod 600` on it, and fill it in. Git ignores `.config/`.
+The server loads this file from its working directory. Environment variables that are already set take priority.
 
 | Variable | Meaning |
 |---|---|
@@ -49,10 +50,11 @@ Copy `.env.example` to `~/.config/huckleberry-mcp/env`, run `chmod 600` on it, a
 | `HUCKLEBERRY_MCP_HOST`, `HUCKLEBERRY_MCP_PORT` | Listen address, default `127.0.0.1:8765` |
 | `HUCKLEBERRY_MCP_BASE_URL` | Public origin of the tunnel, without a path |
 | `CLERK_DOMAIN`, `CLERK_OAUTH_CLIENT_ID`, `CLERK_OAUTH_CLIENT_SECRET` | Clerk OAuth application |
-| `HUCKLEBERRY_MCP_ALLOWED_EMAILS` | Optional comma-separated emails allowed to use the tools |
+| `HUCKLEBERRY_MCP_ALLOWED_EMAILS` | Comma-separated emails allowed to use the tools. Required with Clerk |
 | `HUCKLEBERRY_MCP_NO_AUTH` | Set to `1` to serve HTTP without sign-in. For local testing only |
 
-Without the Clerk variables the server refuses to start in HTTP mode, unless `HUCKLEBERRY_MCP_NO_AUTH=1`.
+The server refuses to start in HTTP mode without the Clerk variables and the email list, unless `HUCKLEBERRY_MCP_NO_AUTH=1`.
+A signed-in user whose email is not in the list sees no tools.
 
 ### 3. Clerk
 
@@ -76,9 +78,9 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=%h/py-huckleberry-api
-EnvironmentFile=%h/.config/huckleberry-mcp/env
 ExecStart=%h/.local/bin/uv run --extra mcp huckleberry-mcp
 Restart=on-failure
+RestartSec=10
 
 [Install]
 WantedBy=default.target

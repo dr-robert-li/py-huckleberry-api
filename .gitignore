@@ -53,3 +53,6 @@ node_modules/
 
 # Planning assets
 .planning/
+
+# Local deployment config (secrets)
+.config/

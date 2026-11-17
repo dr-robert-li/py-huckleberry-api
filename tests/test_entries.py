@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+import copy
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timedelta, timezone
+from typing import cast
+from unittest.mock import AsyncMock
 
+import aiohttp
 import pytest
 from google.cloud.firestore import DELETE_FIELD
+from google.cloud.firestore_v1.field_path import FieldPath
 from pydantic import ValidationError
 
 from huckleberry_api import HuckleberryAPI
@@ -106,8 +111,46 @@ def test_merge_changes_accepts_alias_field() -> None:
     assert merged["_id"] == "abc"
 
 
+def test_merge_changes_rejects_invented_nested_keys() -> None:
+    sleep: dict[str, object] = {"start": 1.0, "duration": 5.0, "offset": 0.0}
+    with pytest.raises(ValueError, match="Invalid value for details"):
+        _merge("sleep", sleep, {"details": {"inventedKey": 1, "sleepLocations": {"hammock": True}}})
+    diaper: dict[str, object] = {"mode": "pee", "start": 1.0, "offset": 0.0}
+    with pytest.raises(ValueError, match="Invalid value for quantity"):
+        _merge("diaper", diaper, {"quantity": {"volume_ml": 3}})
+    # Known nested keys and int-for-float values pass.
+    _merge("sleep", sleep, {"details": {"notes": "x", "sleepLocations": {"car": True}}})
+    _merge("diaper", diaper, {"quantity": {"pee": 50}})
+
+
+@pytest.mark.parametrize(
+    ("tracker", "raw", "changes", "message"),
+    [
+        ("sleep", {"start": 1.0, "duration": 5.0, "offset": 0.0}, {"duration": -1}, "duration must be"),
+        (
+            "feed",
+            {"mode": "breast", "start": 1.0, "lastSide": "left", "offset": 0.0},
+            {"rightDuration": -5.0},
+            "rightDuration must be",
+        ),
+        ("sleep", {"start": 1.0, "duration": 5.0, "offset": 0.0}, {"start": 1_800_000_000_000}, "epoch seconds"),
+        ("sleep", {"start": 1.0, "duration": 5.0, "offset": 0.0}, {"start": -1}, "epoch seconds"),
+    ],
+)
+def test_merge_changes_rejects_implausible_numbers(
+    tracker: Tracker, raw: dict[str, object], changes: dict[str, JsonValue], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _merge(tracker, raw, changes)
+
+
+def test_unknown_field_error_lists_valid_fields() -> None:
+    with pytest.raises(ValueError, match="valid fields: .*amount.*bottleType"):
+        _merge("feed", BOTTLE_RAW, {"volume": 1})
+
+
 # Each case: tracker, raw row, entry id, expected payloads (matching the writer named).
-SUMMARY_CASES: list[tuple[str, Tracker, dict[str, object], str, dict[str, dict[str, object]]]] = [
+SUMMARY_CASES: list[tuple[str, Tracker, dict[str, object], str, dict[str, object]]] = [
     (
         "sleep",
         "sleep",
@@ -154,7 +197,11 @@ SUMMARY_CASES: list[tuple[str, Tracker, dict[str, object], str, dict[str, dict[s
                 "bottleAmount": 120.0,
                 "bottleUnits": "ml",
                 "offset": -60.0,
-            }
+            },
+            # log_bottle also refreshes the next-bottle defaults.
+            "bottleType": "Formula",
+            "bottleAmount": 120.0,
+            "bottleUnits": "ml",
         },
     ),
     (
@@ -370,9 +417,7 @@ SUMMARY_CASES: list[tuple[str, Tracker, dict[str, object], str, dict[str, dict[s
     [case[1:] for case in SUMMARY_CASES],
     ids=[case[0] for case in SUMMARY_CASES],
 )
-def test_summary_payloads(
-    tracker: Tracker, raw: dict[str, object], entry_id: str, expected: dict[str, dict[str, object]]
-) -> None:
+def test_summary_payloads(tracker: Tracker, raw: dict[str, object], entry_id: str, expected: dict[str, object]) -> None:
     row = _validate_row(tracker, raw)
     assert _summary_payloads(entry_id, row, medication_units="drops") == expected
 
@@ -380,7 +425,8 @@ def test_summary_payloads(
 def test_medication_summary_prefers_row_units_over_carried_units() -> None:
     raw = dict(SUMMARY_CASES[7][2])
     row = _validate_row("health", raw)
-    assert _summary_payloads("h2", row, medication_units="drops")["lastMedication"]["units"] == "ml"
+    payload = cast(dict[str, object], _summary_payloads("h2", row, medication_units="drops")["lastMedication"])
+    assert payload["units"] == "ml"
 
 
 def _rows(tracker: Tracker, *items: tuple[str, dict[str, object]]) -> list[tuple[str, HistoryRow]]:
@@ -416,12 +462,228 @@ def test_summary_updates_rewrites_found_and_removes_missing_kinds() -> None:
     updates = _summary_updates({"lastBottle", "lastNursing", "lastSolid"}, latest, None, NOW)
     assert updates == {
         "prefs.lastBottle": _summary_payloads("b1", latest["lastBottle"][1])["lastBottle"],
+        "prefs.bottleType": "Formula",
+        "prefs.bottleAmount": 120.0,
+        "prefs.bottleUnits": "ml",
         "prefs.lastNursing": DELETE_FIELD,
         "prefs.lastSide": DELETE_FIELD,
         "prefs.lastSolid": DELETE_FIELD,
         "prefs.timestamp": {"seconds": NOW},
         "prefs.local_timestamp": NOW,
     }
+
+
+# ---------------------------------------------------------------------------
+# Firestore paths against an in-memory fake (no network)
+# ---------------------------------------------------------------------------
+
+CHILD = "child1"
+
+
+class _Snap:
+    def __init__(self, doc_id: str, data: dict[str, object] | None) -> None:
+        self.id = doc_id
+        self.exists = data is not None
+        self._data = data
+
+    def to_dict(self) -> dict[str, object] | None:
+        return copy.deepcopy(self._data)
+
+
+class _FakeQuery:
+    """Supports the where/order_by/stream subset that _entries.py uses."""
+
+    def __init__(self, db: _FakeDB, path: tuple[str, ...], filters: tuple = (), order: tuple | None = None) -> None:
+        self.db, self.path, self.filters, self.order = db, path, filters, order
+
+    def where(self, *, filter) -> _FakeQuery:
+        return _FakeQuery(self.db, self.path, (*self.filters, filter), self.order)
+
+    def order_by(self, field: str, direction: str = "ASCENDING") -> _FakeQuery:
+        return _FakeQuery(self.db, self.path, self.filters, (field, direction == "DESCENDING"))
+
+    async def stream(self) -> AsyncIterator[_Snap]:
+        ops = {"==": lambda a, b: a == b, ">=": lambda a, b: a >= b, "<": lambda a, b: a < b}
+        rows = [
+            (path[-1], data)
+            for path, data in self.db.docs.items()
+            if path[:-1] == self.path
+            and all(f.field_path in data and ops[f.op_string](data[f.field_path], f.value) for f in self.filters)
+            and (self.order is None or self.order[0] in data)
+        ]
+        if self.order is not None:
+            field, descending = self.order
+            rows.sort(key=lambda row: row[1][field], reverse=descending)
+        for doc_id, data in rows:
+            yield _Snap(doc_id, data)
+
+
+class _FakeDoc:
+    def __init__(self, db: _FakeDB, path: tuple[str, ...]) -> None:
+        self.db, self.path = db, path
+
+    def collection(self, name: str) -> _FakeCollection:
+        return _FakeCollection(self.db, (*self.path, name))
+
+    async def get(self, timeout: float | None = None) -> _Snap:
+        return _Snap(self.path[-1], self.db.docs.get(self.path))
+
+    async def set(self, data: dict[str, object]) -> None:
+        self.db.docs[self.path] = copy.deepcopy(data)
+
+    async def delete(self) -> None:
+        self.db.docs.pop(self.path, None)
+
+    async def update(self, updates: dict[str, object]) -> None:
+        doc = self.db.docs[self.path]  # KeyError mirrors Firestore NotFound
+        for field, value in updates.items():
+            *parents, leaf = FieldPath.from_string(field).parts
+            target = doc
+            for part in parents:
+                target = target.setdefault(part, {})
+            if value is DELETE_FIELD:
+                target.pop(leaf, None)
+            else:
+                target[leaf] = copy.deepcopy(value)
+
+
+class _FakeCollection(_FakeQuery):
+    def __init__(self, db: _FakeDB, path: tuple[str, ...]) -> None:
+        super().__init__(db, path)
+
+    def document(self, doc_id: str) -> _FakeDoc:
+        return _FakeDoc(self.db, (*self.path, doc_id))
+
+
+class _FakeDB:
+    def __init__(self) -> None:
+        self.docs: dict[tuple[str, ...], dict] = {}
+
+    def collection(self, name: str) -> _FakeCollection:
+        return _FakeCollection(self, (name,))
+
+
+def _bottle(start: float, amount: float) -> dict[str, object]:
+    return {"mode": "bottle", "start": start, "bottleType": "Formula", "amount": amount, "units": "ml", "offset": 0.0}
+
+
+FEED = ("feed", CHILD)
+INTERVALS = (*FEED, "intervals")
+
+
+@pytest.fixture
+def fake(monkeypatch: pytest.MonkeyPatch) -> tuple[HuckleberryAPI, _FakeDB]:
+    """API wired to a seeded fake: three bottles (one batched), one nursing, one batched solids."""
+    db = _FakeDB()
+    db.docs[(*INTERVALS, "b-old")] = _bottle(100.0, 60.0)
+    db.docs[(*INTERVALS, "b-new")] = _bottle(300.0, 120.0)
+    db.docs[(*INTERVALS, "n1")] = {"mode": "breast", "start": 200.0, "lastSide": "left", "offset": 0.0}
+    db.docs[(*INTERVALS, "batch")] = {
+        "multi": True,
+        "data": {
+            "k1": _bottle(250.0, 90.0),
+            "k2": {"mode": "solids", "start": 50.0, "offset": 0.0},
+        },
+    }
+    newest = _validate_row("feed", _bottle(300.0, 120.0))
+    nursing = _validate_row("feed", db.docs[(*INTERVALS, "n1")])
+    db.docs[FEED] = {
+        "prefs": {
+            **_summary_payloads("b-new", newest),
+            **_summary_payloads("n1", nursing),
+            "reminderV2": {"mode": "in"},
+        }
+    }
+    api = HuckleberryAPI(email="x", password="x", timezone="UTC", websession=cast(aiohttp.ClientSession, None))
+    monkeypatch.setattr(api, "_get_firestore_client", AsyncMock(return_value=db))
+    return api, db
+
+
+def _prefs(db: _FakeDB) -> dict:
+    return db.docs[FEED]["prefs"]
+
+
+async def test_list_entries_returns_ids_including_batched_rows(fake: tuple[HuckleberryAPI, _FakeDB]) -> None:
+    api, _db = fake
+    start, end = datetime.fromtimestamp(0, timezone.utc), datetime.fromtimestamp(1000, timezone.utc)
+    entries = await api.list_entries(CHILD, "feed", start, end)
+    assert [entry.id for entry in entries] == ["batch/k2", "b-old", "n1", "batch/k1", "b-new"]
+    assert await api.get_entry(CHILD, "feed", "batch/k1") == entries[3]
+    assert await api.get_entry(CHILD, "feed", "batch") is None, "a container is not an entry"
+    assert await api.get_entry(CHILD, "feed", "b-old/k1") is None
+
+
+async def test_delete_latest_rebuilds_summary_and_bottle_defaults(fake: tuple[HuckleberryAPI, _FakeDB]) -> None:
+    api, db = fake
+    nursing_before = copy.deepcopy(_prefs(db)["lastNursing"])
+    await api.delete_entry(CHILD, "feed", "b-new")
+    assert (*INTERVALS, "b-new") not in db.docs
+    prefs = _prefs(db)
+    assert prefs["lastBottle"]["start"] == 250.0
+    assert (prefs["bottleType"], prefs["bottleAmount"], prefs["bottleUnits"]) == ("Formula", 90.0, "ml")
+    assert prefs["lastNursing"] == nursing_before
+    assert prefs["reminderV2"] == {"mode": "in"}
+    assert "seconds" in prefs["timestamp"] and "local_timestamp" in prefs
+    with pytest.raises(ValueError, match="No feed entry"):
+        await api.delete_entry(CHILD, "feed", "b-new")
+
+
+async def test_delete_batched_row_removes_only_that_key(fake: tuple[HuckleberryAPI, _FakeDB]) -> None:
+    api, db = fake
+    await api.delete_entry(CHILD, "feed", "batch/k1")
+    assert set(db.docs[(*INTERVALS, "batch")]["data"]) == {"k2"}
+    assert _prefs(db)["lastBottle"]["start"] == 300.0
+
+
+async def test_update_standalone_and_batched_rows(fake: tuple[HuckleberryAPI, _FakeDB]) -> None:
+    api, db = fake
+    updated = await api.update_entry(CHILD, "feed", "b-old", {"amount": 70})
+    assert db.docs[(*INTERVALS, "b-old")]["amount"] == 70
+    assert "lastUpdated" in db.docs[(*INTERVALS, "b-old")]
+    assert updated.data.model_dump()["amount"] == 70
+    assert _prefs(db)["bottleAmount"] == 120.0, "an older row does not take over the defaults"
+
+    await api.update_entry(CHILD, "feed", "batch/k1", {"start": 400.0, "amount": 80.0})
+    batch = db.docs[(*INTERVALS, "batch")]["data"]
+    assert (batch["k1"]["start"], batch["k1"]["amount"]) == (400.0, 80.0)
+    assert batch["k2"] == {"mode": "solids", "start": 50.0, "offset": 0.0}
+    assert (_prefs(db)["lastBottle"]["start"], _prefs(db)["bottleAmount"]) == (400.0, 80.0)
+
+    # Moving the newest row back in time hands the summary to the next latest row.
+    await api.update_entry(CHILD, "feed", "batch/k1", {"start": 10.0})
+    assert _prefs(db)["lastBottle"]["start"] == 300.0
+
+
+async def test_summary_removed_when_no_row_remains(fake: tuple[HuckleberryAPI, _FakeDB]) -> None:
+    api, db = fake
+    await api.delete_entry(CHILD, "feed", "n1")
+    assert "lastNursing" not in _prefs(db)
+    assert "lastSide" not in _prefs(db)
+
+    for entry_id in ("b-new", "batch/k1", "b-old"):
+        await api.delete_entry(CHILD, "feed", entry_id)
+    prefs = _prefs(db)
+    assert "lastBottle" not in prefs
+    # With no bottle left the defaults keep the last values written.
+    assert (prefs["bottleType"], prefs["bottleAmount"], prefs["bottleUnits"]) == ("Formula", 60.0, "ml")
+
+
+async def test_invalid_other_row_aborts_before_any_write(fake: tuple[HuckleberryAPI, _FakeDB]) -> None:
+    api, db = fake
+    db.docs[(*INTERVALS, "bad")] = {"mode": "bottle", "start": 150.0}
+    before = copy.deepcopy(db.docs)
+    with pytest.raises(ValidationError):
+        await api.update_entry(CHILD, "feed", "b-new", {"amount": 1.0})
+    with pytest.raises(ValidationError):
+        await api.delete_entry(CHILD, "feed", "b-new")
+    with pytest.raises(ValueError, match="Invalid value for foods"):
+        await api.update_entry(
+            CHILD,
+            "feed",
+            "batch/k2",
+            {"foods": {"x": {"id": "x", "created_name": "X", "source": "custom", "bogus": 1}}},
+        )
+    assert db.docs == before
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +696,12 @@ async def _last_summaries(api: HuckleberryAPI, child_uid: str, tracker: Tracker)
     db = await api._get_firestore_client()
     snapshot = await db.collection(tracker).document(child_uid).get()
     prefs = (snapshot.to_dict() or {}).get("prefs") or {}
-    return {key: value for key, value in prefs.items() if key.startswith("last")}
+    summaries = {key: value for key, value in prefs.items() if key.startswith("last")}
+    # App-written and library-written health summaries differ only in whether they carry `isNight`.
+    for value in summaries.values():
+        if isinstance(value, dict):
+            value.pop("isNight", None)
+    return summaries
 
 
 LogFn = Callable[[HuckleberryAPI, str, datetime], Awaitable[None]]
