@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
-- Add a remote MCP server, ``huckleberry-mcp`` (``mcp`` extra), for Claude custom connectors. It serves Streamable HTTP with Clerk OAuth sign-in through FastMCP and an email allowlist, or stdio for local clients. Tools cover sleep, nursing, bottle, pump, activity, solids, diaper, potty, growth, temperature and medicine, plus history listing, edit and delete.
+- Add a remote MCP server, ``huckleberry-mcp`` (``mcp`` extra), for Claude custom connectors. It serves Streamable HTTP with Clerk OAuth sign-in through FastMCP and an email allowlist, or stdio for local clients. Tools cover sleep, nursing, bottle, pump, activity, solids, diaper, potty, growth, temperature and medicine, plus history listing, edit and delete. Configuration comes from the environment and from ``.config/.env`` in the working directory. Timer tools report an error when no timer is running.
 - Add entry management to ``HuckleberryAPI``: ``get_tracker``, ``list_entries``, ``get_entry``, ``update_entry`` and ``delete_entry``. History entries now carry ids. Edit and delete rebuild the ``prefs.last*`` summaries from the latest remaining entries.
 
 ### Misc

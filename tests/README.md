@@ -108,6 +108,8 @@ Tests run on Python 3.14.
 
 **Recommendation**: Use a test account with test child data, not your real baby tracking account.
 
+The live tests in `test_entries.py` and `test_mcp_server.py` delete the entries they create and restore the `prefs.last*` summaries. Other live tests can leave entries behind.
+
 ## Skipped Tests
 
 Tests will automatically skip if:

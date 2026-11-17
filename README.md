@@ -62,7 +62,7 @@ In the Clerk Dashboard, for a development instance:
 
 1. **User authentication > Access mode**: select Invite-only, then invite each family member under **Users**.
 2. **SSO connections > Add connection > For all users**: select Google. Development instances need no Google Cloud setup.
-3. **OAuth applications > Add application**: scopes `openid email profile`, redirect URI `<HUCKLEBERRY_MCP_BASE_URL>/auth/callback`. Copy the client ID and the client secret. Clerk shows the secret once.
+3. **OAuth applications > Add application**: scopes `openid email profile`, redirect URI `<HUCKLEBERRY_MCP_BASE_URL>/auth/callback`, entered exactly, with no trailing slash. Copy the client ID and the client secret. Clerk shows the secret once.
 
 `CLERK_DOMAIN` is the instance host, for example `your-instance.clerk.accounts.dev`.
 
@@ -104,7 +104,19 @@ For a local MCP client, run `uv run --extra mcp huckleberry-mcp --stdio`. No sig
 3. Select **Connect** and sign in with Google.
 
 The connector then appears in the Claude mobile app for the same account. Each family member repeats these steps
-in their own Claude account.
+in their own Claude account. Each must be invited in Clerk and listed in `HUCKLEBERRY_MCP_ALLOWED_EMAILS`.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Sign-in fails with "redirect_uri ... does not match" | The Clerk OAuth application does not list `<HUCKLEBERRY_MCP_BASE_URL>/auth/callback`. Add it exactly |
+| Connected, but Claude shows no tools | The signed-in email is not in `HUCKLEBERRY_MCP_ALLOWED_EMAILS` |
+| Service exits with "Refusing to start" | A Clerk variable, the base URL, or the email list is missing. The message names it |
+| A change to `.config/.env` has no effect | Restart: `systemctl --user restart huckleberry-mcp` |
+| Claude cannot reach the server just after Funnel is enabled | Funnel can take a few minutes to reach every public address. Try again |
+
+Logs: `journalctl --user -u huckleberry-mcp -f`.
 
 ### Tools
 
