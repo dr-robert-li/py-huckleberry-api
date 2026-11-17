@@ -360,10 +360,10 @@ def _merge_changes(
     for key, value in changes.items():
         if value is not None and dumped.get(key) != value:
             raise ValueError(f"Invalid value for {key}: {value!r} is not a valid {model.__name__} value")
-    for key in ("duration", "leftDuration", "rightDuration"):
+    for key in ("duration", "leftDuration", "rightDuration", "amount", "leftAmount", "rightAmount"):
         value = dumped.get(key)
-        if key in changes and value is not None and not value >= 0:
-            raise ValueError(f"{key} must be a non-negative number of seconds")
+        if key in changes and isinstance(value, int | float) and not value >= 0:
+            raise ValueError(f"{key} must be non-negative")
     if "start" in changes and not 0 <= dumped["start"] < _MS_EPOCH_THRESHOLD:
         raise ValueError("start must be epoch seconds")
     return merged, updated

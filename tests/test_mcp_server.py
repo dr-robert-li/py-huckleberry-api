@@ -228,7 +228,7 @@ async def test_allowlist_middleware_hides_tools_without_token() -> None:
 def test_load_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     (tmp_path / ".config").mkdir()
     (tmp_path / ".config" / ".env").write_text(
-        "# comment\nHB_TEST_A=from-file\nexport HB_TEST_B='quoted value'\nHB_TEST_EMPTY=\nHB_TEST_SET=from-file\n"
+        "# comment\n=orphan\nHB_TEST_Q=secret\"\nHB_TEST_A=from-file\nexport HB_TEST_B='quoted value'\nHB_TEST_EMPTY=\nHB_TEST_SET=from-file\n"
     )
     monkeypatch.chdir(tmp_path)
     for key in ("HB_TEST_A", "HB_TEST_B", "HB_TEST_EMPTY"):
@@ -237,6 +237,7 @@ def test_load_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     mcp_server.load_env_file()
     try:
         assert os.environ["HB_TEST_A"] == "from-file"
+        assert os.environ.pop("HB_TEST_Q") == 'secret"'
         assert os.environ["HB_TEST_B"] == "quoted value"
         assert "HB_TEST_EMPTY" not in os.environ
         assert os.environ["HB_TEST_SET"] == "from-env"

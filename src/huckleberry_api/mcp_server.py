@@ -865,10 +865,12 @@ def load_env_file(path: str = ".config/.env") -> None:
     if not file.is_file():
         return
     for line in file.read_text().splitlines():
-        key, sep, value = line.strip().removeprefix("export ").partition("=")
-        value = value.strip().strip("'\"")
-        if sep and value and not key.startswith("#"):
-            os.environ.setdefault(key.strip(), value)
+        key, _, value = line.strip().removeprefix("export ").partition("=")
+        key, value = key.strip(), value.strip()
+        if len(value) > 1 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if key and value and not key.startswith("#"):
+            os.environ.setdefault(key, value)
 
 
 def main() -> None:

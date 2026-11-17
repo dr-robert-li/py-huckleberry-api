@@ -133,6 +133,12 @@ def test_merge_changes_rejects_invented_nested_keys() -> None:
             {"rightDuration": -5.0},
             "rightDuration must be",
         ),
+        (
+            "feed",
+            {"mode": "bottle", "start": 1.0, "bottleType": "Formula", "amount": 60.0, "units": "ml", "offset": 0.0},
+            {"amount": -5.0},
+            "amount must be",
+        ),
         ("sleep", {"start": 1.0, "duration": 5.0, "offset": 0.0}, {"start": 1_800_000_000_000}, "epoch seconds"),
         ("sleep", {"start": 1.0, "duration": 5.0, "offset": 0.0}, {"start": -1}, "epoch seconds"),
     ],
