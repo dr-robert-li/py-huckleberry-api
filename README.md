@@ -1,8 +1,10 @@
-# Huckleberry MCP
+# Huckleberry API
 
 [![Integration Tests](https://github.com/dr-robert-li/py-huckleberry-api/actions/workflows/integration-tests.yml/badge.svg)](https://github.com/dr-robert-li/py-huckleberry-api/actions/workflows/integration-tests.yml)
 
-MCP server and Python API client for the Huckleberry baby tracking app.
+Python API client for the Huckleberry baby tracking app using Firebase Firestore.
+
+## Fork Additions
 
 This is a fork of [Woyken/py-huckleberry-api](https://github.com/Woyken/py-huckleberry-api). It keeps the
 upstream library and adds:
@@ -13,7 +15,7 @@ upstream library and adds:
 
 ## Overview
 
-The library is a reverse-engineered client that connects directly to Huckleberry's Firebase backend using the official Google Cloud Firestore SDK. Everything written through it appears in the Huckleberry app.
+This is a reverse-engineered API client that connects directly to Huckleberry's Firebase backend using the official Google Cloud Firestore SDK. It provides programmatic access to baby tracking features including sleep, feeding, diaper changes, and growth measurements.
 
 ## MCP Server
 
