@@ -1,12 +1,125 @@
-# Huckleberry API
+# Huckleberry MCP
 
-[![Integration Tests](https://github.com/Woyken/py-huckleberry-api/actions/workflows/integration-tests.yml/badge.svg)](https://github.com/Woyken/py-huckleberry-api/actions/workflows/integration-tests.yml)
+[![Integration Tests](https://github.com/dr-robert-li/py-huckleberry-api/actions/workflows/integration-tests.yml/badge.svg)](https://github.com/dr-robert-li/py-huckleberry-api/actions/workflows/integration-tests.yml)
 
-Python API client for the Huckleberry baby tracking app using Firebase Firestore.
+MCP server and Python API client for the Huckleberry baby tracking app.
+
+This is a fork of [Woyken/py-huckleberry-api](https://github.com/Woyken/py-huckleberry-api). It keeps the
+upstream library and adds:
+
+- a remote MCP server (`huckleberry-mcp`) that you add to Claude as a custom connector, so the family can log and
+  manage baby care by chat, including from the Claude mobile app
+- entry management in the library: list history with ids, edit entries, delete entries
 
 ## Overview
 
-This is a reverse-engineered API client that connects directly to Huckleberry's Firebase backend using the official Google Cloud Firestore SDK. It provides programmatic access to baby tracking features including sleep, feeding, diaper changes, and growth measurements.
+The library is a reverse-engineered client that connects directly to Huckleberry's Firebase backend using the official Google Cloud Firestore SDK. Everything written through it appears in the Huckleberry app.
+
+## MCP Server
+
+```
+Claude (web, desktop, mobile) --HTTPS--> Tailscale Funnel --> huckleberry-mcp (127.0.0.1) --gRPC--> Huckleberry Firebase
+                                              sign-in: Clerk (Google)
+```
+
+| Part | Choice | Why |
+|---|---|---|
+| Server | [FastMCP](https://gofastmcp.com) over Streamable HTTP at `/mcp` | One module, no custom protocol code |
+| Sign-in | [Clerk](https://clerk.com) OAuth through FastMCP's `ClerkProvider` | Claude connectors sign in with OAuth; Clerk supplies Google sign-in and invite-only access |
+| Tunnel | [Tailscale Funnel](https://tailscale.com/kb/1223/funnel) | Stable public HTTPS URL, no domain or open port |
+
+The server signs in to Huckleberry with one account. Everyone who connects writes as that account.
+
+### 1. Install
+
+```bash
+git clone https://github.com/dr-robert-li/py-huckleberry-api
+cd py-huckleberry-api
+uv sync --extra mcp
+```
+
+### 2. Configure
+
+Copy `.env.example` to `~/.config/huckleberry-mcp/env`, run `chmod 600` on it, and fill it in.
+
+| Variable | Meaning |
+|---|---|
+| `HUCKLEBERRY_EMAIL`, `HUCKLEBERRY_PASSWORD` | Huckleberry account the server writes as |
+| `HUCKLEBERRY_TIMEZONE` | IANA timezone for times without an offset, for example `Australia/Sydney` |
+| `HUCKLEBERRY_MCP_HOST`, `HUCKLEBERRY_MCP_PORT` | Listen address, default `127.0.0.1:8765` |
+| `HUCKLEBERRY_MCP_BASE_URL` | Public origin of the tunnel, without a path |
+| `CLERK_DOMAIN`, `CLERK_OAUTH_CLIENT_ID`, `CLERK_OAUTH_CLIENT_SECRET` | Clerk OAuth application |
+| `HUCKLEBERRY_MCP_ALLOWED_EMAILS` | Optional comma-separated emails allowed to use the tools |
+| `HUCKLEBERRY_MCP_NO_AUTH` | Set to `1` to serve HTTP without sign-in. For local testing only |
+
+Without the Clerk variables the server refuses to start in HTTP mode, unless `HUCKLEBERRY_MCP_NO_AUTH=1`.
+
+### 3. Clerk
+
+In the Clerk Dashboard, for a development instance:
+
+1. **User authentication > Access mode**: select Invite-only, then invite each family member under **Users**.
+2. **SSO connections > Add connection > For all users**: select Google. Development instances need no Google Cloud setup.
+3. **OAuth applications > Add application**: scopes `openid email profile`, redirect URI `<HUCKLEBERRY_MCP_BASE_URL>/auth/callback`. Copy the client ID and the client secret. Clerk shows the secret once.
+
+`CLERK_DOMAIN` is the instance host, for example `your-instance.clerk.accounts.dev`.
+
+### 4. Run
+
+Set `WorkingDirectory` to your clone.
+
+```ini
+# ~/.config/systemd/user/huckleberry-mcp.service
+[Unit]
+Description=Huckleberry MCP server
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/py-huckleberry-api
+EnvironmentFile=%h/.config/huckleberry-mcp/env
+ExecStart=%h/.local/bin/uv run --extra mcp huckleberry-mcp
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now huckleberry-mcp
+loginctl enable-linger "$USER"        # keep it running after logout
+tailscale funnel --bg 8765            # public https://<machine>.<tailnet>.ts.net -> 127.0.0.1:8765
+```
+
+Funnel must be enabled for the tailnet. The first `tailscale funnel` run prints a link to enable it.
+
+For a local MCP client, run `uv run --extra mcp huckleberry-mcp --stdio`. No sign-in applies.
+
+### 5. Connect Claude
+
+1. On claude.ai, open **Settings > Connectors > Add custom connector**.
+2. Enter `<HUCKLEBERRY_MCP_BASE_URL>/mcp` and add it.
+3. Select **Connect** and sign in with Google.
+
+The connector then appears in the Claude mobile app for the same account. Each family member repeats these steps
+in their own Claude account.
+
+### Tools
+
+| Tool | Purpose |
+|---|---|
+| `list_children`, `get_status` | Children; running timers, latest entry of each kind, local time |
+| `sleep_timer`, `log_sleep` | Start, pause, resume, cancel, complete the sleep timer; log a finished sleep |
+| `nursing_timer`, `log_nursing`, `log_bottle` | Breastfeeding timer with side switch; log nursing or a bottle |
+| `pump_timer`, `log_pump` | Pump timer; log a pump session |
+| `activity_timer`, `log_activity` | Activity timers (bath, tummy time and so on); log an activity |
+| `list_foods`, `create_custom_food`, `log_solids` | Find or add foods; log a solids meal |
+| `log_diaper`, `log_potty` | Diaper change or potty event |
+| `log_growth`, `log_temperature` | Weight, height, head; body temperature |
+| `list_medicine_types`, `create_medicine_type`, `log_medicine` | Medicines and doses |
+| `list_entries`, `update_entry`, `delete_entry` | History with ids; edit or delete an entry |
+
+Times are ISO 8601. A time without an offset is in `HUCKLEBERRY_TIMEZONE`. An omitted time means now.
 
 ## Features
 
@@ -20,14 +133,20 @@ This is a reverse-engineered API client that connects directly to Huckleberry's 
 - 💊 **Medicine Tracking**: Manage medicine types and record doses
 - 🔄 **Real-time Updates**: Firebase snapshot listeners for instant synchronization
 - 👶 **Child Management**: Support for multiple children profiles
+- 🗂️ **Entry Management**: List history with ids, edit entries, delete entries
+- 🤖 **MCP Server**: Remote MCP server for Claude custom connectors
 
 ## Installation
 
+This fork is not published to PyPI. Install it from GitHub:
+
 ```bash
-uv add huckleberry-api
-# or
-pip install huckleberry-api
+uv add "huckleberry-api @ git+https://github.com/dr-robert-li/py-huckleberry-api"
+# with the MCP server
+uv add "huckleberry-api[mcp] @ git+https://github.com/dr-robert-li/py-huckleberry-api"
 ```
+
+The upstream library is on PyPI as `huckleberry-api`.
 
 ## Quick Start
 
@@ -230,6 +349,16 @@ async def main() -> None:
   - `amount`: Optional; the app-compatible blank value is stored as `0.0`
   - `units`: `"ml"`, `"oz"`, `"tsp"`, or `"drops"`
 
+### Entry Management
+`tracker` is one of `"sleep"`, `"feed"`, `"diaper"`, `"health"`, `"pump"`, `"activities"`.
+- `await get_tracker(child_uid, tracker)` - Get the typed tracker document (timer and `prefs`)
+- `await list_entries(child_uid, tracker, start_time, end_time)` - List history as `HistoryEntry` objects with ids
+- `await get_entry(child_uid, tracker, entry_id)` - Get one entry by id
+- `await update_entry(child_uid, tracker, entry_id, changes)` - Change Firebase fields of an entry; a `None` value removes a field
+- `await delete_entry(child_uid, tracker, entry_id)` - Delete an entry
+
+`update_entry` and `delete_entry` rebuild the `prefs.last*` summaries from the latest remaining entries, so the app's "last" cards stay correct.
+
 ### Real-time Listeners
 - `await setup_sleep_listener(child_uid, callback)` - Listen to sleep updates
 - `await setup_feed_listener(child_uid, callback)` - Listen to feeding updates
@@ -270,6 +399,8 @@ Modules prefixed with `_` are internal implementation. The supported surface is
 | `_account.py` | Child and user profile reads |
 | `_sleep.py`, `_feeding.py`, `_solids.py`, `_diaper.py`, `_health.py`, `_pump.py`, `_activity.py` | Tracker features |
 | `_history.py` | Date-range history queries |
+| `_entries.py` | History with ids, entry edit and delete |
+| `mcp_server.py` | MCP server (`huckleberry-mcp`, needs the `mcp` extra) |
 | `_listeners.py` | Real-time snapshot listeners |
 | `_const.py`, `_common.py` | Constants and shared internals |
 
@@ -283,6 +414,7 @@ Huckleberry's Firebase Security Rules block non-SDK requests. Direct REST API ca
 - `google-cloud-firestore>=2.11.0`
 - `aiohttp>=3.10.0`
 - `pydantic>=2.10.0`
+- `fastmcp>=4.2.0` for the MCP server (`mcp` extra)
 
 ## Development
 
@@ -327,7 +459,7 @@ See [tests/README.md](tests/README.md) for detailed testing documentation.
 
 ## License
 
-MIT License
+MIT License. Copyright (c) 2025 Woyken, Copyright (c) 2026 Robert Li. See [LICENSE](LICENSE).
 
 ## Disclaimer
 
@@ -335,4 +467,5 @@ This is an unofficial, reverse-engineered API client. It is not affiliated with,
 
 ## Related Projects
 
-- [Huckleberry Home Assistant Integration](https://github.com/Woyken/huckleberry-homeassistant) - Home automation integration using this library
+- [py-huckleberry-api](https://github.com/Woyken/py-huckleberry-api) - Upstream library by Woyken that this fork builds on
+- [Huckleberry Home Assistant Integration](https://github.com/Woyken/huckleberry-homeassistant) - Home automation integration using the upstream library

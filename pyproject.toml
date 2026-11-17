@@ -1,11 +1,12 @@
 [project]
 name = "huckleberry-api"
-version = "0.5.1"
-description = "Python API client for Huckleberry baby tracking app using Firebase Firestore"
+version = "0.6.0"
+description = "MCP server and Python API client for the Huckleberry baby tracking app"
 readme = { file = "README.md", content-type = "text/markdown" }
 license = { text = "MIT" }
 authors = [
-    { name = "Woyken", email = "13166802+Woyken@users.noreply.github.com" }
+    { name = "Woyken", email = "13166802+Woyken@users.noreply.github.com" },
+    { name = "Robert Li", email = "155333421+dr-robert-li@users.noreply.github.com" },
 ]
 requires-python = ">=3.14"
 dependencies = [
@@ -15,7 +16,7 @@ dependencies = [
     "aiohttp>=3.10.0",
     "tzdata>=2024.1",
 ]
-keywords = ["huckleberry", "baby", "tracking", "firebase", "api"]
+keywords = ["huckleberry", "baby", "tracking", "firebase", "api", "mcp"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -24,13 +25,20 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 
+[project.optional-dependencies]
+mcp = ["fastmcp>=4.2.0"]
+
+[project.scripts]
+huckleberry-mcp = "huckleberry_api.mcp_server:main"
+
 [project.urls]
-Homepage = "https://github.com/Woyken/py-huckleberry-api"
-Repository = "https://github.com/Woyken/py-huckleberry-api"
-Issues = "https://github.com/Woyken/py-huckleberry-api/issues"
+Homepage = "https://github.com/dr-robert-li/py-huckleberry-api"
+Repository = "https://github.com/dr-robert-li/py-huckleberry-api"
+Upstream = "https://github.com/Woyken/py-huckleberry-api"
 
 [dependency-groups]
 dev = [
+    "fastmcp>=4.2.0",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "ruff>=0.11.0",
@@ -43,7 +51,7 @@ directory = "newsfragments"
 filename = "CHANGELOG.md"
 start_string = "<!-- towncrier release notes start -->\n"
 title_format = "## [{version}] - {project_date}"
-issue_format = "[#{issue}](https://github.com/Woyken/py-huckleberry-api/issues/{issue})"
+issue_format = "[#{issue}](https://github.com/dr-robert-li/py-huckleberry-api/issues/{issue})"
 
 [tool.ruff]
 target-version = "py314"
