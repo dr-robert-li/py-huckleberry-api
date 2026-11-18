@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- towncrier release notes start -->
 
+## [0.6.2] - 2026-11-18
+
+### Bugfixes
+
+- Commit an edited or deleted entry and its ``prefs.last*`` summary update in one Firestore write batch, so a failed summary write no longer leaves the summary pointing at a deleted entry.
+- The MCP ``log_medicine`` tool reports an error when several medicines share the name, instead of picking the first.
+- With ``HUCKLEBERRY_MCP_NO_AUTH=1`` the MCP server ignores the email allowlist, which used to hide every tool.
+- ``update_entry`` rejects non-finite durations and amounts.
+
+
 ## [0.6.1] - 2026-11-17
 
 ### Bugfixes
